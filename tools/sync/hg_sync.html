@@ -1,0 +1,308 @@
+<!doctype html>
+<!-- Hiking Gadget v2: set the clock from this computer over USB (SPEC 5.6). Chrome or Edge on a desktop;
+     a single file with no network access. Close the Arduino Serial Monitor first: one program per COM port. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hiking Gadget Sync</title>
+<style>
+  :root { --bg: #f6f6f3; --fg: #1d1d1b; --muted: #6b6b66; --card: #ffffff; --line: #d9d9d3;
+          --accent: #1f6feb; --ok: #1a7f37; --bad: #c62828; --mono: ui-monospace, Consolas, monospace; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161615; --fg: #ecece8; --muted: #9a9a94; --card: #20201e; --line: #3a3a36;
+            --accent: #4c8dff; --ok: #3fb950; --bad: #ff6b6b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.45 system-ui, sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 20px; color: var(--muted); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; }
+  button { font: inherit; padding: 9px 16px; border-radius: 8px; border: 1px solid var(--line);
+           background: var(--card); color: var(--fg); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+  #status { margin-top: 12px; font-weight: 600; }
+  #status.ok { color: var(--ok); }
+  #status.bad { color: var(--bad); }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+  pre { margin: 0; max-height: 240px; overflow: auto; font: 12px/1.4 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+  .hint { color: var(--muted); font-size: 14px; margin: 12px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Hiking Gadget Sync</h1>
+  <p class="sub">Sets the gadget clock from this computer over USB. Press any key on the gadget first if its screen is off.</p>
+
+  <div class="card">
+    <div class="row">
+      <button id="connect" class="primary">Connect</button>
+      <button id="sync" disabled>Sync time</button>
+      <button id="check" disabled>Check drift</button>
+      <button id="zone" disabled>Set zone = PC zone</button>
+      <button id="disconnect" disabled>Disconnect</button>
+    </div>
+    <div id="status">Not connected.</div>
+    <p class="hint" id="zoneHint"></p>
+  </div>
+
+  <div class="card">
+    <dl>
+      <dt>Gadget</dt><dd id="dev">-</dd>
+      <dt>Last reply</dt><dd id="reply">-</dd>
+      <dt>Drift</dt><dd id="drift">-</dd>
+    </dl>
+  </div>
+
+  <div class="card">
+    <pre id="log"></pre>
+  </div>
+</main>
+
+<script>
+"use strict";
+const ESPRESSIF_VID = 0x303A;
+const HINT = "Press any key on the gadget first (screen off = asleep or powered off), then Connect again. " +
+             "Port busy? Close the Arduino Serial Monitor.";
+
+// Device zone ids (src/core/tz.cpp, kTzTable). IANA names first; a zone missing here is matched by its offsets.
+const TZ_BY_IANA = {
+  "America/Los_Angeles": "LAX", "America/New_York": "NYC", "UTC": "UTC", "Etc/UTC": "UTC", "Etc/GMT": "UTC",
+  "Europe/London": "LON", "Europe/Dublin": "LON", "Europe/Lisbon": "LON",
+  "Europe/Berlin": "CET", "Europe/Paris": "CET", "Europe/Rome": "CET", "Europe/Madrid": "CET", "Europe/Warsaw": "CET",
+  "Europe/Prague": "CET", "Europe/Vienna": "CET", "Europe/Amsterdam": "CET", "Europe/Belgrade": "CET",
+  "Europe/Helsinki": "EET", "Europe/Kyiv": "EET", "Europe/Kiev": "EET", "Europe/Riga": "EET", "Europe/Vilnius": "EET",
+  "Europe/Tallinn": "EET", "Europe/Sofia": "EET", "Europe/Bucharest": "EET", "Europe/Athens": "EET",
+  "Europe/Kaliningrad": "KGD", "Europe/Moscow": "MSK", "Europe/Minsk": "MSK", "Europe/Istanbul": "MSK",
+  "Europe/Simferopol": "MSK", "Europe/Volgograd": "MSK", "Europe/Kirov": "MSK",
+  "Europe/Samara": "SAM", "Europe/Saratov": "SAM", "Europe/Ulyanovsk": "SAM", "Europe/Astrakhan": "SAM",
+  "Asia/Dubai": "SAM", "Asia/Baku": "SAM", "Asia/Tbilisi": "SAM", "Asia/Yerevan": "SAM",
+  "Asia/Yekaterinburg": "YEK", "Asia/Tashkent": "YEK", "Asia/Almaty": "YEK", "Asia/Samarkand": "YEK",
+  "Asia/Kolkata": "DEL", "Asia/Calcutta": "DEL",
+  "Asia/Omsk": "OMS", "Asia/Bishkek": "OMS",
+  "Asia/Novosibirsk": "NSK", "Asia/Krasnoyarsk": "NSK", "Asia/Barnaul": "NSK", "Asia/Tomsk": "NSK",
+  "Asia/Novokuznetsk": "NSK", "Asia/Bangkok": "NSK",
+  "Asia/Irkutsk": "IRK", "Asia/Shanghai": "IRK", "Asia/Singapore": "IRK", "Asia/Hong_Kong": "IRK",
+  "Asia/Yakutsk": "YAK", "Asia/Chita": "YAK", "Asia/Tokyo": "YAK", "Asia/Seoul": "YAK",
+  "Asia/Vladivostok": "VLA", "Asia/Magadan": "MAG", "Asia/Sakhalin": "MAG", "Asia/Srednekolymsk": "MAG",
+  "Asia/Kamchatka": "PET", "Asia/Anadyr": "PET",
+};
+// [id, standard offset in minutes, DST rule] in table order, for the offset fallback.
+const TZ_TABLE = [
+  ["LAX", -480, "US"], ["NYC", -300, "US"], ["UTC", 0, ""], ["LON", 0, "EU"], ["CET", 60, "EU"], ["EET", 120, "EU"],
+  ["KGD", 120, ""], ["MSK", 180, ""], ["SAM", 240, ""], ["YEK", 300, ""], ["DEL", 330, ""], ["OMS", 360, ""],
+  ["NSK", 420, ""], ["IRK", 480, ""], ["YAK", 540, ""], ["VLA", 600, ""], ["MAG", 660, ""], ["PET", 720, ""],
+];
+
+const $ = id => document.getElementById(id);
+let port = null, reader = null, readDone = null, lineBuf = "", busy = false;
+const waiters = [];
+
+function setStatus(text, cls) { const s = $("status"); s.textContent = text; s.className = cls || ""; }
+function logLine(text) {
+  const el = $("log");
+  el.textContent += text + "\n";
+  if (el.textContent.length > 20000) el.textContent = el.textContent.slice(-15000);
+  el.scrollTop = el.scrollHeight;
+}
+function enable(connected) {
+  $("connect").disabled = connected;
+  for (const id of ["sync", "check", "zone", "disconnect"]) $(id).disabled = !connected || busy;
+  if (connected) $("disconnect").disabled = false;
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function pcZone() {
+  const iana = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+  if (TZ_BY_IANA[iana]) return { iana, id: TZ_BY_IANA[iana], how: "by name" };
+  const y = new Date().getFullYear();
+  const jan = -new Date(y, 0, 1).getTimezoneOffset(), jul = -new Date(y, 6, 1).getTimezoneOffset();
+  const std = Math.min(jan, jul), dst = jan !== jul;
+  // US and EU zones in the table have disjoint standard offsets, so the offset picks the rule.
+  const hit = TZ_TABLE.find(([, off, rule]) => off === std && (rule !== "") === dst);
+  return { iana, id: hit ? hit[0] : null, how: "by offset" };
+}
+
+function onLine(line) {
+  if (!line) return;
+  logLine(line);
+  for (const w of waiters.slice()) {
+    if (w.prefixes.some(p => line.startsWith(p))) {
+      clearTimeout(w.timer);
+      waiters.splice(waiters.indexOf(w), 1);
+      w.resolve(line);
+    }
+  }
+}
+
+// Register the waiter BEFORE sending, so a fast reply cannot slip past it.
+function waitReply(prefixes, ms) {
+  return new Promise(resolve => {
+    const w = { prefixes, resolve };
+    w.timer = setTimeout(() => { waiters.splice(waiters.indexOf(w), 1); resolve(null); }, ms);
+    waiters.push(w);
+  });
+}
+
+async function send(text) {
+  const writer = port.writable.getWriter();
+  try { await writer.write(new TextEncoder().encode(text + "\n")); } finally { writer.releaseLock(); }
+}
+
+async function request(text, prefixes, ms) {
+  const p = waitReply(prefixes, ms);
+  await send(text);
+  return p;
+}
+
+async function readLoop() {
+  const decoder = new TextDecoderStream("utf-8");
+  readDone = port.readable.pipeTo(decoder.writable).catch(() => {});
+  reader = decoder.readable.getReader();
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      lineBuf += value;
+      let i;
+      while ((i = lineBuf.indexOf("\n")) >= 0) {
+        const line = lineBuf.slice(0, i).replace(/\r$/, "").trim();
+        lineBuf = lineBuf.slice(i + 1);
+        onLine(line);
+      }
+    }
+  } catch (e) {
+    logLine("[read stopped: " + e.message + "]");
+  }
+}
+
+// PING every 300 ms for up to 10 s; this also absorbs a board reset caused by opening the port.
+async function ping() {
+  const end = Date.now() + 10000;
+  while (Date.now() < end) {
+    const line = await request("PING", ["PONG HG2"], 300);
+    if (line) return line;
+  }
+  return null;
+}
+
+async function withDevice(what, fn) {
+  if (busy) return;
+  busy = true; enable(true);
+  try {
+    setStatus(what + "...");
+    const pong = await ping();
+    if (!pong) { setStatus("No answer. " + HINT, "bad"); return; }
+    $("dev").textContent = pong;
+    await fn();
+  } catch (e) {
+    setStatus(what + " failed: " + e.message + ". " + HINT, "bad");
+  } finally {
+    busy = false; enable(port !== null);
+  }
+}
+
+function deviceUtcMs(line) {
+  const m = /utc=(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)\.(\d{3})Z/.exec(line);
+  return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6], +m[7]) : null;
+}
+
+async function syncTime() {
+  await withDevice("Syncing", async () => {
+    await sleep(1000 - (Date.now() % 1000));           // send at the next PC second boundary
+    const line = await request("TIME " + (Date.now() / 1000).toFixed(3), ["OK TIME", "ERR"], 2000);
+    if (!line) { setStatus("No reply to TIME. " + HINT, "bad"); return; }
+    $("reply").textContent = line;
+    if (line.startsWith("ERR")) { setStatus("The gadget rejected the time: is this computer's clock right?", "bad"); return; }
+    const m = /delta=([-+]?\d+\.\d+)s/.exec(line);
+    $("drift").textContent = m ? "before sync (gadget - PC): " + (+m[1] >= 0 ? "+" : "") + (+m[1]).toFixed(2) + " s" : "-";
+    setStatus("Time set.", "ok");
+  });
+}
+
+async function checkDrift() {
+  await withDevice("Checking", async () => {
+    const t0 = Date.now();
+    const line = await request("TIME?", ["TIME utc="], 2000);
+    const t1 = Date.now();
+    if (!line) { setStatus("No reply to TIME?. " + HINT, "bad"); return; }
+    $("reply").textContent = line;
+    const dev = deviceUtcMs(line);
+    if (dev === null) { setStatus("Unexpected reply format.", "bad"); return; }
+    const off = (dev - (t0 + t1) / 2) / 1000;
+    $("drift").textContent = "now (gadget - PC): " + (off >= 0 ? "+" : "") + off.toFixed(2) + " s";
+    setStatus("Drift measured, clock not changed.", "ok");
+  });
+}
+
+async function setZone() {
+  const z = pcZone();
+  if (!z.id) { setStatus("No gadget zone matches " + z.iana + ". Pick one on the gadget: Settings > Time zone.", "bad"); return; }
+  await withDevice("Setting zone", async () => {
+    const line = await request("TZ " + z.id, ["OK TZ", "ERR"], 2000);
+    if (!line) { setStatus("No reply to TZ. " + HINT, "bad"); return; }
+    $("reply").textContent = line;
+    setStatus(line.startsWith("OK") ? "Zone set to " + z.id + "." : "Zone not set: " + line, line.startsWith("OK") ? "ok" : "bad");
+  });
+}
+
+async function closePort() {
+  const p = port;
+  port = null;
+  for (const w of waiters.splice(0)) { clearTimeout(w.timer); w.resolve(null); }
+  try { if (reader) await reader.cancel(); } catch (e) { /* already closed */ }
+  try { if (readDone) await readDone; } catch (e) { /* already closed */ }
+  try { if (p) await p.close(); } catch (e) { /* already closed or unplugged */ }
+  reader = null; readDone = null; lineBuf = "";
+  enable(false);
+}
+
+async function connect() {
+  let p;
+  try {
+    p = await navigator.serial.requestPort({ filters: [{ usbVendorId: ESPRESSIF_VID }] });
+  } catch (e) {
+    // NotFoundError: the user closed the chooser, or no Espressif port was offered.
+    setStatus("No gadget port selected. " + HINT, "bad");
+    return;
+  }
+  try {
+    await p.open({ baudRate: 115200 });
+  } catch (e) {
+    setStatus("Cannot open the port: " + e.message + ". " + HINT, "bad");
+    return;
+  }
+  try { await p.setSignals({ dataTerminalReady: false, requestToSend: false }); } catch (e) { logLine("[setSignals: " + e.message + "]"); }
+  port = p;
+  enable(true);
+  readLoop();
+  await withDevice("Connecting", async () => setStatus("Connected.", "ok"));
+}
+
+navigator.serial && navigator.serial.addEventListener("disconnect", e => {
+  if (port && e.target === port) { closePort(); setStatus("Gadget disconnected. " + HINT, "bad"); }
+});
+
+window.addEventListener("DOMContentLoaded", () => {
+  const z = pcZone();
+  $("zoneHint").textContent = "PC zone: " + (z.iana || "unknown") + " → " +
+    (z.id ? "gadget zone " + z.id + " (" + z.how + ")" : "no matching gadget zone");
+  if (!("serial" in navigator)) {
+    $("connect").disabled = true;
+    setStatus("This browser has no Web Serial. Open this file in Chrome or Edge on a computer, or use tools/sync_time.py.", "bad");
+    return;
+  }
+  $("connect").onclick = connect;
+  $("sync").onclick = syncTime;
+  $("check").onclick = checkDrift;
+  $("zone").onclick = setZone;
+  $("disconnect").onclick = async () => { await closePort(); setStatus("Not connected."); };
+});
+</script>
+</body>
+</html>

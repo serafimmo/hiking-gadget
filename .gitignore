@@ -1,0 +1,10 @@
+# Build output never lives in the repo (builds go to /dev/shm or /mnt/wd)
+build/
+*.o
+*.a
+*.pbm
+!tools/host/golden/*.pbm
+__pycache__/
+*.pyc
+# Local Claude Code settings (machine-specific)
+.claude/
